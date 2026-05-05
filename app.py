@@ -3,11 +3,13 @@ from databricks import sql
 import pandas as pd
 import plotly.express as px
 import uuid
+import hashlib
+import secrets
 from datetime import datetime, date, timedelta
 
-st.set_page_config(page_title="Time Entry App", layout="wide")
+st.set_page_config(page_title="Game Changer Time Entry", layout="wide")
 
-# ── Connection ────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def get_conn():
     return sql.connect(
         server_hostname=st.secrets["DATABRICKS_HOST"],
@@ -37,31 +39,84 @@ def week_start(d=None):
     d = d or date.today()
     return d - timedelta(days=d.weekday())
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.title("Game Changer Time Entry App")
-role = st.sidebar.selectbox("Login as:", ["employee", "manager", "admin"])
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-users_df = run_query(f"SELECT user_id, name FROM workspace.time_tracker.users WHERE is_active=true AND role='{role}'")
+def generate_password():
+    return secrets.token_urlsafe(8)
 
-if users_df.empty:
-    st.warning("No users found for this role. Please run all 4 Databricks notebooks first.")
+# ── Session State Init ─────────────────────────────────────────────────────────
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+    st.session_state.user_id   = None
+    st.session_state.user_name = None
+    st.session_state.role      = None
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  LOGIN PAGE
+# ════════════════════════════════════════════════════════════════════════════════
+if not st.session_state.logged_in:
+    st.markdown("""
+        <h1 style='text-align:center; margin-top: 80px;'>🕐 Game Changer Time Entry</h1>
+        <p style='text-align:center; color:gray;'>Please log in to continue</p>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        with st.form("login_form"):
+            st.markdown("### Login")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            login_btn = st.form_submit_button("Login", use_container_width=True)
+
+        if login_btn:
+            if not username.strip() or not password.strip():
+                st.error("Please enter both username and password.")
+            else:
+                ph = hash_password(password)
+                result = run_query(f"""
+                    SELECT u.user_id, u.name, u.role, u.is_active
+                    FROM workspace.time_tracker.user_credentials uc
+                    JOIN workspace.time_tracker.users u ON uc.user_id = u.user_id
+                    WHERE uc.username = '{safe(username.strip())}' AND uc.password_hash = '{ph}'
+                """)
+                if result.empty:
+                    st.error("Invalid username or password.")
+                elif not bool(result.iloc[0]["is_active"]):
+                    st.error("Your account has been deactivated. Please contact your admin.")
+                else:
+                    st.session_state.logged_in = True
+                    st.session_state.user_id   = result.iloc[0]["user_id"]
+                    st.session_state.user_name = result.iloc[0]["name"]
+                    st.session_state.role      = result.iloc[0]["role"]
+                    st.rerun()
     st.stop()
 
-user_name = st.sidebar.selectbox("Select user:", users_df["name"].tolist())
-user_id = users_df[users_df["name"] == user_name]["user_id"].iloc[0]
+# ── Logged-in vars ─────────────────────────────────────────────────────────────
+user_id   = st.session_state.user_id
+user_name = st.session_state.user_name
+role      = st.session_state.role
 
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+st.sidebar.title("Game Changer Time Entry")
+st.sidebar.markdown(f"**👤 {user_name}**")
+st.sidebar.markdown(f"Role: `{role.title()}`")
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"**User:** {user_name}")
-st.sidebar.markdown(f"**Role:** {role.title()}")
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.logged_in = False
+    st.session_state.user_id   = None
+    st.session_state.user_name = None
+    st.session_state.role      = None
+    st.rerun()
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  EMPLOYEE VIEW
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 if role == "employee":
     st.title(f"My Time Entries — {user_name}")
     tab1, tab2, tab3 = st.tabs(["Log Time", "My Entries", "My Stats"])
 
-    # ── Log Time ─────────────────────────────────────────────────────────────
+    # ── Log Time ──────────────────────────────────────────────────────────────
     with tab1:
         st.subheader("Log New Time Entry")
         projects = run_query("SELECT project_id, project_name, project_code FROM workspace.time_tracker.projects WHERE status='active' ORDER BY project_code")
@@ -69,29 +124,29 @@ if role == "employee":
 
         with st.form("log_time"):
             selected_proj = st.selectbox("Project:", list(proj_options.keys()))
-            entry_date = st.date_input("Date:", value=date.today())
-            hours = st.number_input("Hours:", min_value=0.5, max_value=24.0, step=0.5, value=8.0)
-            description = st.text_area("What did you work on?", height=100)
-            submit_now = st.checkbox("Submit for approval now", value=True)
-            submitted = st.form_submit_button("Save Entry")
+            entry_date    = st.date_input("Date:", value=date.today())
+            hours         = st.number_input("Hours:", min_value=0.5, max_value=24.0, step=0.5, value=8.0)
+            description   = st.text_area("What did you work on?", height=100)
+            submit_now    = st.checkbox("Submit for approval now", value=True)
+            submitted     = st.form_submit_button("Save Entry")
 
         if submitted:
             if not description.strip():
                 st.error("Please add a description.")
             else:
-                proj_id = proj_options[selected_proj]
-                status = "submitted" if submit_now else "draft"
-                ws = str(week_start(entry_date))
-                entry_id = new_id()
-                now_ts = datetime.now().isoformat()
-                flag = False
+                proj_id    = proj_options[selected_proj]
+                status     = "submitted" if submit_now else "draft"
+                ws         = str(week_start(entry_date))
+                entry_id   = new_id()
+                now_ts     = datetime.now().isoformat()
+                flag        = False
                 flag_reason = ""
 
                 if hours > 10:
-                    flag = True
+                    flag        = True
                     flag_reason = "Excessive hours: more than 10h in a single day"
                 if entry_date.weekday() >= 5:
-                    flag = True
+                    flag        = True
                     flag_reason = (flag_reason + " | " if flag_reason else "") + "Weekend entry"
 
                 run_update(f"""
@@ -152,9 +207,9 @@ if role == "employee":
                          title="My Hours by Project (Last 4 Weeks)")
             st.plotly_chart(fig, use_container_width=True)
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  MANAGER VIEW
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 elif role == "manager":
     st.title(f"Manager Dashboard — {user_name}")
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -180,7 +235,7 @@ elif role == "manager":
             for _, row in df.iterrows():
                 label = f"{row['employee']} | {row['project_code']} | {row['entry_date']} | {row['hours']}h"
                 if row["is_flagged"]:
-                    label += f"  🚩"
+                    label += "  🚩"
                 with st.expander(label):
                     st.write(f"**Description:** {row['description']}")
                     if row["is_flagged"]:
@@ -271,7 +326,6 @@ elif role == "manager":
             fig = px.bar(df, x="week_start", y="hours", color="project_code",
                          title="Weekly Hours by Project", barmode="stack")
             st.plotly_chart(fig, use_container_width=True)
-
             weekly = df.groupby("week_start")["hours"].sum().reset_index()
             fig2 = px.line(weekly, x="week_start", y="hours",
                            title="Total Team Hours per Week", markers=True)
@@ -294,13 +348,12 @@ elif role == "manager":
             ORDER BY pct DESC
         """)
         for _, row in df.iterrows():
-            pct = float(row["pct"]) if row["pct"] else 0.0
+            pct    = float(row["pct"]) if row["pct"] else 0.0
             colour = "red" if pct >= 100 else "orange" if pct >= 80 else "green"
             st.markdown(f"**{row['project_code']}** — {row['project_name']}")
             st.progress(min(pct / 100, 1.0))
             st.markdown(f":{colour}[{row['logged']}h / {row['budget_hours']}h ({pct:.1f}%)]")
             st.divider()
-
         if not df.empty:
             fig = px.bar(df, x="pct", y="project_code", orientation="h",
                          title="Budget Burn-down (%)", color="pct",
@@ -310,9 +363,9 @@ elif role == "manager":
             fig.add_vline(x=100, line_dash="dash", line_color="red",    annotation_text="100%")
             st.plotly_chart(fig, use_container_width=True)
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 #  ADMIN VIEW
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 elif role == "admin":
     st.title(f"Admin Panel — {user_name}")
     tab1, tab2, tab3 = st.tabs(["Manage Users", "Manage Projects", "Full Report"])
@@ -320,24 +373,58 @@ elif role == "admin":
     # ── Manage Users ──────────────────────────────────────────────────────────
     with tab1:
         st.subheader("All Users")
-        df = run_query("SELECT user_id, name, email, role, department, is_active FROM workspace.time_tracker.users ORDER BY role, name")
-        st.dataframe(df, use_container_width=True)
+        df = run_query("""
+            SELECT u.user_id, u.name, u.email, u.role, u.department, u.is_active, uc.username
+            FROM workspace.time_tracker.users u
+            LEFT JOIN workspace.time_tracker.user_credentials uc ON u.user_id = uc.user_id
+            ORDER BY u.role, u.name
+        """)
+        st.dataframe(df[["name", "email", "role", "department", "is_active", "username"]], use_container_width=True)
 
         st.subheader("Add New User")
         with st.form("add_user"):
-            n_name  = st.text_input("Full Name")
-            n_email = st.text_input("Email")
-            n_role  = st.selectbox("Role", ["employee", "manager", "admin"])
-            n_dept  = st.text_input("Department")
-            mgrs    = run_query("SELECT user_id, name FROM workspace.time_tracker.users WHERE role='manager' AND is_active=true")
-            mgr_map = {"None": ""} | {r["name"]: r["user_id"] for _, r in mgrs.iterrows()}
-            n_mgr   = st.selectbox("Manager (for employees):", list(mgr_map.keys()))
-            if st.form_submit_button("Add User"):
-                mgr_val = f"'{mgr_map[n_mgr]}'" if mgr_map[n_mgr] else "NULL"
-                uid = new_id()
-                run_update(f"INSERT INTO workspace.time_tracker.users VALUES ('{uid}', '{safe(n_name)}', '{safe(n_email)}', '{n_role}', {mgr_val}, '{safe(n_dept)}', true, current_timestamp())")
-                st.success(f"User {n_name} added!")
-                st.rerun()
+            n_name     = st.text_input("Full Name")
+            n_email    = st.text_input("Email")
+            n_role     = st.selectbox("Role", ["employee", "manager", "admin"])
+            n_dept     = st.text_input("Department")
+            mgrs       = run_query("SELECT user_id, name FROM workspace.time_tracker.users WHERE role='manager' AND is_active=true")
+            mgr_map    = {"None": ""} | {r["name"]: r["user_id"] for _, r in mgrs.iterrows()}
+            n_mgr      = st.selectbox("Manager (for employees):", list(mgr_map.keys()))
+            st.markdown("**Login Credentials**")
+            n_username = st.text_input("Username (e.g. alice.smith)")
+            n_password = st.text_input("Password", value=generate_password(),
+                                       help="Auto-generated — you can change it before saving")
+            if st.form_submit_button("Add User & Create Login"):
+                if not n_name.strip() or not n_username.strip() or not n_password.strip():
+                    st.error("Name, username, and password are all required.")
+                else:
+                    # Check if username already exists
+                    existing = run_query(f"SELECT username FROM workspace.time_tracker.user_credentials WHERE username = '{safe(n_username.strip())}'")
+                    if not existing.empty:
+                        st.error(f"Username '{n_username}' is already taken. Please choose another.")
+                    else:
+                        mgr_val = f"'{mgr_map[n_mgr]}'" if mgr_map[n_mgr] else "NULL"
+                        uid     = new_id()
+                        ph      = hash_password(n_password)
+                        run_update(f"INSERT INTO workspace.time_tracker.users VALUES ('{uid}', '{safe(n_name)}', '{safe(n_email)}', '{n_role}', {mgr_val}, '{safe(n_dept)}', true, current_timestamp())")
+                        run_update(f"INSERT INTO workspace.time_tracker.user_credentials VALUES ('{uid}', '{safe(n_username.strip())}', '{ph}', current_timestamp(), current_timestamp())")
+                        st.success(f"✅ User **{n_name}** added!")
+                        st.info(f"Share these login details with them:\n\n**Username:** `{n_username.strip()}`\n\n**Password:** `{n_password}`")
+                        st.rerun()
+
+        st.subheader("Reset User Password")
+        with st.form("reset_pw"):
+            all_users  = run_query("SELECT u.name, uc.username FROM workspace.time_tracker.users u JOIN workspace.time_tracker.user_credentials uc ON u.user_id = uc.user_id WHERE u.is_active=true ORDER BY u.name")
+            user_names = all_users["name"].tolist()
+            reset_user = st.selectbox("Select user:", user_names)
+            new_pw     = st.text_input("New Password", value=generate_password())
+            if st.form_submit_button("Reset Password"):
+                uid_row = run_query(f"SELECT u.user_id FROM workspace.time_tracker.users u WHERE u.name = '{safe(reset_user)}'")
+                if not uid_row.empty:
+                    ph = hash_password(new_pw)
+                    run_update(f"UPDATE workspace.time_tracker.user_credentials SET password_hash = '{ph}', updated_at = current_timestamp() WHERE user_id = '{uid_row.iloc[0]['user_id']}'")
+                    st.success(f"Password reset for **{reset_user}**")
+                    st.info(f"New password: `{new_pw}`")
 
         st.subheader("Deactivate User")
         active_users = df[df["is_active"] == True]["name"].tolist()
